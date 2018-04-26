@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <mutex>
-#include <iostream>
+//#include <iostream>
 
 struct Timer
 {
@@ -40,7 +40,7 @@ protected:
 
         bool operator<(const HeapEntry & entry)
         {
-            return time < entry.time;
+            return time > entry.time;
         }
     };
 
@@ -54,14 +54,14 @@ public:
         _heap_mutex()
     {}
         
-    virtual ~TimerManager() {}
+    virtual ~TimerManager() { fina(); }
 
     void init()
     {
         _run_thread = std::thread(&TimerManager::run, this);
     }
 
-    void final()
+    void fina()
     {
         _stop_running = true;
         _run_thread.join();
@@ -95,7 +95,7 @@ public:
 
         _heap_mutex.lock();
         _timer_heap.push_back(entry);
-        std::push_heap(_timer_heap.begin(), _timer_heap.end());
+        std::make_heap(_timer_heap.begin(), _timer_heap.end());
         _heap_mutex.unlock();
     
         return _timer_id;
@@ -128,10 +128,12 @@ protected:
             uint64_t now_time = get_current_millisecs();
             
             _heap_mutex.lock();
+
+            int i = 0;
             auto it = _timer_heap.begin();
             while(it != _timer_heap.end())
             {
-                if(it->time < now_time && it->timer.loop_times != 0)
+                if(it->time <= now_time && it->timer.loop_times != 0)
                 {
                     exec_entry(*it);
 
