@@ -4,6 +4,7 @@
     > Mail: xiaolongicx@gmail.com
     > Created Time: Sun 01 Apr 2018 05:35:44 AM UTC
  ************************************************************************/
+
 #ifndef __TIMER_H__
 #define __TIMER_H__
 
@@ -15,7 +16,6 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <mutex>
-
 #include <iostream>
 
 struct Timer
@@ -127,9 +127,8 @@ public:
 
         {
             std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
-            _timer_heap.push_back(entry);
 
-            sort_heap();
+            push_heap(entry);
         }
     
         return _timer_id;
@@ -146,7 +145,7 @@ public:
                 {
                     _timer_heap.erase(it);
 
-                    sort_heap();
+                    make_heap();
 
                     break;
                 }
@@ -165,37 +164,50 @@ protected:
         {
             uint64_t now_time = get_current_subtlesecs();
 
+            do
             {
-                std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
-                auto it = _timer_heap.begin();
-                while(it != _timer_heap.end())
+                HeapEntry top_entry;
+
                 {
-                    if(it->time <= now_time && it->timer.loop_times != 0)
+                    std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+                    
+                    if(_timer_heap.empty())
                     {
-                        exec_entry(*it);
+                        cout << "empty" << endl;
 
-                        if(it->timer.loop_times == 0)
-                        {
-                            it = _timer_heap.erase(it);
-                        }
-                        else
-                        {
-                            ++it;
-                        }
-
-                        sort_heap();
-                    }
-                    else
-                    {
+                        ++idle_cnt;
                         break;
                     }
+
+                    top_entry = pop_heap();
                 }
 
-                if(it == _timer_heap.end())
+                cout << top_entry.id << " " << top_entry.time << " " << top_entry.timer.loop_times << endl;
+
+                if(top_entry.time <= now_time)
                 {
-                    ++idle_cnt;
+                    if(top_entry.timer.loop_times != 0)
+                    {
+                        exec_entry(top_entry);
+                    }
+
+                    if(top_entry.timer.loop_times != 0)
+                    {
+                        std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+
+                        push_heap(top_entry);
+                    }
+
+                    break;
                 }
-            }
+                else
+                {
+                    push_heap(top_entry);
+
+                    ++idle_cnt;
+                    break;
+                }
+            }while(0);
 
             if(idle_cnt >= 100)
             {
@@ -239,9 +251,26 @@ protected:
     }
 
 protected:
-    inline void sort_heap()
+    inline void make_heap()
     {
         std::make_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
+    }
+
+    inline HeapEntry pop_heap()
+    {
+        std::pop_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
+
+        HeapEntry top_entry = _timer_heap.back();
+        _timer_heap.pop_back();
+
+        return top_entry;
+    }
+
+    inline void push_heap(const HeapEntry & entry)
+    {
+        _timer_heap.push_back(entry);
+
+        std::push_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
     }
 
 protected:
@@ -253,6 +282,5 @@ protected:
     std::recursive_mutex _heap_mutex;
 };
 
-#endif  //__TIMER_H__
-
+#endif  //__SL_TIMER_H__
 
