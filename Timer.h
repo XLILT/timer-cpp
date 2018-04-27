@@ -15,7 +15,8 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <mutex>
-//#include <iostream>
+
+#include <iostream>
 
 struct Timer
 {
@@ -38,7 +39,12 @@ protected:
         Timer timer;
         int32_t id;
 
-        bool operator<(const HeapEntry & entry)
+        bool operator<(const HeapEntry & entry) const
+        {
+            return time < entry.time;
+        }
+
+        bool operator>(const HeapEntry & entry) const
         {
             return time > entry.time;
         }
@@ -58,13 +64,39 @@ public:
 
     void init()
     {
-        _run_thread = std::thread(&TimerManager::run, this);
+        try
+        {
+            _run_thread = std::thread(&TimerManager::run, this);
+        }
+        catch(const std::exception & e)
+        {
+            std::cout << "init exception " << e.what() << std::endl;
+        }
+        catch(...)
+        {
+            std::cout << "init unknow exception" << std::endl;
+        }
     }
 
     void fina()
     {
         _stop_running = true;
-        _run_thread.join();
+
+        try
+        {
+            if(_run_thread.joinable())
+            {
+                _run_thread.join();
+            }
+        }
+        catch(const std::exception & e)
+        {
+            std::cout << "fina exception " << e.what() << std::endl;
+        }
+        catch(...)
+        {
+            std::cout << "fina unknow exception" << std::endl;
+        }
     }
 
     int32_t add_timer(const Timer & timer)
@@ -77,7 +109,7 @@ public:
         uint64_t expires_time = 0;
         if(!timer.immediately)
         {
-            expires_time = get_current_millisecs() + timer.interval;
+            expires_time = get_current_subtlesecs() + timer.interval * 1000;
         }
 
         _timer_id++;
@@ -93,69 +125,83 @@ public:
             exec_entry(entry);
         }
 
-        _heap_mutex.lock();
-        _timer_heap.push_back(entry);
-        std::make_heap(_timer_heap.begin(), _timer_heap.end());
-        _heap_mutex.unlock();
+        {
+            std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+            _timer_heap.push_back(entry);
+
+            sort_heap();
+        }
     
         return _timer_id;
     }
 
     void remove_timer(int32_t id)
     {    
-        _heap_mutex.lock();
-        auto it = _timer_heap.begin();
-        while(it != _timer_heap.end())
         {
-            if(it->id == id)
+            std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+            auto it = _timer_heap.begin();
+            while(it != _timer_heap.end())
             {
-                _timer_heap.erase(it);
-                std::make_heap(_timer_heap.begin(), _timer_heap.end());
-                break;
-            }
-            
-            ++it;
-        }
+                if(it->id == id)
+                {
+                    _timer_heap.erase(it);
 
-        _heap_mutex.unlock();
+                    sort_heap();
+
+                    break;
+                }
+                
+                ++it;
+            }
+        }
     }
 
 protected:
     void run()
     {
+        int idle_cnt = 0;
+
         while(!_stop_running)
         {
-            uint64_t now_time = get_current_millisecs();
-            
-            _heap_mutex.lock();
+            uint64_t now_time = get_current_subtlesecs();
 
-            int i = 0;
-            auto it = _timer_heap.begin();
-            while(it != _timer_heap.end())
             {
-                if(it->time <= now_time && it->timer.loop_times != 0)
+                std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+                auto it = _timer_heap.begin();
+                while(it != _timer_heap.end())
                 {
-                    exec_entry(*it);
-
-                    if(it->timer.loop_times == 0)
+                    if(it->time <= now_time && it->timer.loop_times != 0)
                     {
-                        it = _timer_heap.erase(it);
+                        exec_entry(*it);
+
+                        if(it->timer.loop_times == 0)
+                        {
+                            it = _timer_heap.erase(it);
+                        }
+                        else
+                        {
+                            ++it;
+                        }
+
+                        sort_heap();
                     }
                     else
                     {
-                        ++it;
+                        break;
                     }
-
-                    std::make_heap(_timer_heap.begin(), _timer_heap.end());
                 }
-                else
+
+                if(it == _timer_heap.end())
                 {
-                    break;
+                    ++idle_cnt;
                 }
             }
 
-            _heap_mutex.unlock();
-            usleep(1000);
+            if(idle_cnt >= 100)
+            {
+                usleep(1);
+                idle_cnt = 0;
+            }
         }
     }
 
@@ -171,15 +217,31 @@ protected:
             entry.timer.loop_times--;
         }
 
-        entry.time = get_current_millisecs() + entry.timer.interval;
+        entry.time = get_current_subtlesecs() + entry.timer.interval * 1000;
     }
 
     static uint64_t get_current_millisecs()
     {
-        timeval tv;         
+        timeval tv;
         ::gettimeofday(&tv, 0);
         uint64_t ret = tv.tv_sec;
+
         return ret * 1000 + tv.tv_usec / 1000;    
+    }
+    
+    static uint64_t get_current_subtlesecs()
+    {
+        timeval tv;
+        ::gettimeofday(&tv, 0);
+        uint64_t ret = tv.tv_sec;
+
+        return ret * 1000 * 1000 + tv.tv_usec;
+    }
+
+protected:
+    inline void sort_heap()
+    {
+        std::make_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
     }
 
 protected:
@@ -188,7 +250,7 @@ protected:
     bool _stop_running;
     std::thread _run_thread;
     int32_t _timer_id;
-    std::mutex _heap_mutex;
+    std::recursive_mutex _heap_mutex;
 };
 
 #endif  //__TIMER_H__
