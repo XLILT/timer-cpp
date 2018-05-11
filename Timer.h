@@ -10,13 +10,16 @@
 
 #include <inttypes.h>
 #include <functional>
-#include <vector>
 #include <thread>
-#include <algorithm>
 #include <unistd.h>
 #include <sys/time.h>
 #include <mutex>
-#include <iostream>
+#include <unordered_map>
+#include <atomic>
+
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <memory.h>
 
 struct Timer
 {
@@ -33,53 +36,52 @@ struct Timer
 class TimerManager
 {
 protected:
-    struct HeapEntry
+    struct Entry
     {
         uint64_t time;
         Timer timer;
         int32_t id;
-
-        bool operator<(const HeapEntry & entry) const
-        {
-            return time < entry.time;
-        }
-
-        bool operator>(const HeapEntry & entry) const
-        {
-            return time > entry.time;
-        }
+        int32_t fd;
     };
-
 
 public:
     TimerManager():
-        _timer_heap(),
         _stop_running(false),
         _run_thread(),
         _timer_id(0),
-        _heap_mutex()
+        _epoll_fd(0),
+        _entry_map(),
+        _entry_map_mutex()
     {}
         
     virtual ~TimerManager() { fina(); }
 
-    void init()
+    int init()
     {
+        int ret = 0;
+
         try
         {
+            _epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+
             _run_thread = std::thread(&TimerManager::run, this);
         }
         catch(const std::exception & e)
         {
-            std::cout << "init exception " << e.what() << std::endl;
+            ret = -1;
         }
         catch(...)
         {
-            std::cout << "init unknow exception" << std::endl;
+            ret = -2;
         }
+
+        return ret;
     }
 
-    void fina()
+    int fina()
     {
+        int ret = 0;
+
         _stop_running = true;
 
         try
@@ -91,17 +93,23 @@ public:
         }
         catch(const std::exception & e)
         {
-            std::cout << "fina exception " << e.what() << std::endl;
+            ret = -1;
         }
         catch(...)
         {
-            std::cout << "fina unknow exception" << std::endl;
+            ret = -2;
         }
+
+        close(_epoll_fd);
+
+
+        return ret;
     }
 
     int32_t add_timer(const Timer & timer)
     {
-        if(timer.interval == 0)
+        if(timer.interval == 0
+            || (timer.loop_times <= 0 && timer.loop_times != Timer::LOOP_FOREVER))
         {
             return 0;
         }
@@ -109,116 +117,127 @@ public:
         uint64_t expires_time = 0;
         if(!timer.immediately)
         {
-            expires_time = get_current_subtlesecs() + timer.interval * 1000;
+            expires_time = get_current_millisecs() + timer.interval;
         }
+       
+        int32_t tid = 0;
 
-        _timer_id++;
-        if(_timer_id == 0)
+        do
         {
-            _timer_id++;
-        }
+            tid = ++_timer_id;
+        }while(_entry_map.count(tid) > 0);
 
-        HeapEntry entry = {expires_time, timer, _timer_id};
-
-        if(timer.immediately)
+        int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+        if (-1 == tfd)
         {
-            exec_entry(entry);
+            return 0;
+        }
+
+        struct itimerspec span;
+
+        memset(&span, 0, sizeof(struct itimerspec));
+
+        span.it_value.tv_sec = timer.interval / 1000;
+        span.it_value.tv_nsec = (timer.interval % 1000) * 1000000; // 1ms = 1000000ns
+        
+        span.it_interval.tv_sec  = timer.interval / 1000;
+        span.it_interval.tv_nsec = (timer.interval % 1000) * 1000000;
+        
+
+        if (0 != timerfd_settime(tfd, 0, &span, NULL))
+        {
+            return 0;
         }
 
         {
-            std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+            std::unique_lock<std::recursive_mutex> guard(_entry_map_mutex);
+            Entry entry = {expires_time, timer, tid, tfd};
+            
+            _entry_map[tid] = entry;
 
-            push_heap(entry);
+            struct epoll_event ev;
+
+            memset(&ev, 0, sizeof(struct epoll_event));
+
+            ev.events = EPOLLIN | EPOLLET;
+            ev.data.u64 = (uint64_t)tid;
+
+            if (0 != epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, tfd, &ev))
+            {
+                remove_timer(tid);
+
+                return 0;
+            }
+
+            if(timer.immediately)
+            {
+                exec_entry(_entry_map[tid]);
+            }
         }
-    
-        return _timer_id;
+
+        return tid;
     }
 
     void remove_timer(int32_t id)
     {    
+        std::unique_lock<std::recursive_mutex> guard(_entry_map_mutex);
+
+        if(0 == _entry_map.count(id))
         {
-            std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
-            auto it = _timer_heap.begin();
-            while(it != _timer_heap.end())
-            {
-                if(it->id == id)
-                {
-                    _timer_heap.erase(it);
-
-                    make_heap();
-
-                    break;
-                }
-                
-                ++it;
-            }
+            return;
         }
+
+        auto & entry = _entry_map[id];
+
+        close(entry.fd);
+
+        epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, entry.fd, NULL);
+
+        _entry_map.erase(id);        
     }
 
 protected:
     void run()
     {
-        int idle_cnt = 0;
-
         while(!_stop_running)
         {
-            uint64_t now_time = get_current_subtlesecs();
+            struct epoll_event evs[1024];
+            memset(evs, 0, 1024 * sizeof(struct epoll_event));
 
-            do
+            int esize = epoll_wait(_epoll_fd, evs, 1024, 100);
+
+            for(int i = 0; i < esize; ++i)
             {
-                HeapEntry top_entry;
-
+                if(EPOLLIN | evs[i].events)
                 {
-                    std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
+                    std::unique_lock<std::recursive_mutex> guard(_entry_map_mutex);
+
+                    int32_t tid = (int32_t)evs[i].data.u64;
+                    if(0 == _entry_map.count(tid))
+                    {
+                        continue;
+                    }
+
+                    Entry & entry = _entry_map[tid];
                     
-                    if(_timer_heap.empty())
-                    {
-                        cout << "empty" << endl;
+                    char trigger_buffer[64];
+                    read(entry.fd, trigger_buffer, 64);
 
-                        ++idle_cnt;
-                        break;
-                    }
-
-                    top_entry = pop_heap();
-                }
-
-                cout << top_entry.id << " " << top_entry.time << " " << top_entry.timer.loop_times << endl;
-
-                if(top_entry.time <= now_time)
-                {
-                    if(top_entry.timer.loop_times != 0)
-                    {
-                        exec_entry(top_entry);
-                    }
-
-                    if(top_entry.timer.loop_times != 0)
-                    {
-                        std::lock_guard<std::recursive_mutex> guard(_heap_mutex);
-
-                        push_heap(top_entry);
-                    }
-
-                    break;
-                }
-                else
-                {
-                    push_heap(top_entry);
-
-                    ++idle_cnt;
-                    break;
-                }
-            }while(0);
-
-            if(idle_cnt >= 100)
-            {
-                usleep(1);
-                idle_cnt = 0;
+                    exec_entry(entry);
+                }            
             }
         }
     }
 
-    void exec_entry(HeapEntry & entry)
+    void exec_entry(Entry & entry)
     {
+        if(entry.timer.loop_times == 0)
+        {
+            remove_timer(entry.id);
+
+            return;
+        }
+
         if(entry.timer.callback)
         {
             entry.timer.callback();
@@ -226,10 +245,17 @@ protected:
 
         if(entry.timer.loop_times != Timer::LOOP_FOREVER)
         {
-            entry.timer.loop_times--;
+            --entry.timer.loop_times;
         }
 
-        entry.time = get_current_subtlesecs() + entry.timer.interval * 1000;
+        if(entry.timer.loop_times == 0)
+        {
+            remove_timer(entry.id);
+        }
+        else
+        {
+            entry.time = get_current_millisecs() + entry.timer.interval;
+        }
     }
 
     static uint64_t get_current_millisecs()
@@ -240,46 +266,17 @@ protected:
 
         return ret * 1000 + tv.tv_usec / 1000;    
     }
-    
-    static uint64_t get_current_subtlesecs()
-    {
-        timeval tv;
-        ::gettimeofday(&tv, 0);
-        uint64_t ret = tv.tv_sec;
-
-        return ret * 1000 * 1000 + tv.tv_usec;
-    }
-
-protected:
-    inline void make_heap()
-    {
-        std::make_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
-    }
-
-    inline HeapEntry pop_heap()
-    {
-        std::pop_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
-
-        HeapEntry top_entry = _timer_heap.back();
-        _timer_heap.pop_back();
-
-        return top_entry;
-    }
-
-    inline void push_heap(const HeapEntry & entry)
-    {
-        _timer_heap.push_back(entry);
-
-        std::push_heap(_timer_heap.begin(), _timer_heap.end(), std::greater<HeapEntry>());
-    }
 
 protected:
 
-    std::vector<HeapEntry> _timer_heap;
-    bool _stop_running;
+    volatile bool _stop_running;
     std::thread _run_thread;
-    int32_t _timer_id;
-    std::recursive_mutex _heap_mutex;
+
+    std::atomic<int32_t> _timer_id;
+
+    int32_t _epoll_fd;
+    std::unordered_map<int32_t, Entry> _entry_map;
+    std::recursive_mutex _entry_map_mutex;
 };
 
 #endif  //__SL_TIMER_H__

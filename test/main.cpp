@@ -281,7 +281,6 @@ int main()
     
     test_run_times(tmanager);
 
-    usleep(1000000);
     sleep(2);
     cout << x << endl;
     assert(x == 100);
